@@ -7,6 +7,7 @@ import { Extension } from "resource:///org/gnome/shell/extensions/extension.js";
  * Key names in the GSettings schema that reference a boolean value.
  */
 export type BoolSettingKey =
+  | "animate-window-movement"
   | "auto-close"
   | "auto-maximize"
   | "follow-cursor"

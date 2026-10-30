@@ -481,6 +481,10 @@
       <default>false</default>
       <summary>Automatically maximize windows that cover the entire grid</summary>
     </key>
+    <key type="b" name="animate-window-movement">
+      <default>true</default>
+      <summary>Animate windows when they are moved or resized</summary>
+    </key>
     <key type="b" name="follow-cursor">
       <default>false</default>
       <summary>Place the gTile overlay near the mouse cursor</summary>

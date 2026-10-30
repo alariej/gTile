@@ -121,6 +121,7 @@ export default class App implements GarbageCollector {
       layoutManager: Main.layoutManager,
       monitorManager: Shell.Global.get().backend.get_monitor_manager(),
       workspaceManager: Shell.Global.get().workspace_manager,
+      windowManager: Main.wm,
       userPreferences: new UserPreferences({ settings: this.#settings }),
     });
     this.#gc.defer(() => this.#desktopManager.release());

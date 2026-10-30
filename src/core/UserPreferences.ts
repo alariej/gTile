@@ -8,6 +8,7 @@ export interface UserPreferencesProvider {
   getInset(primary: boolean): Inset;
   getSpacing(): number;
   getAutoMaximize(): boolean;
+  getAnimateWindowMovement(): boolean;
 }
 
 export interface UserPreferencesParams {
@@ -57,5 +58,12 @@ export default class implements UserPreferencesProvider {
   */
   getAutoMaximize(): boolean {
     return this.#settings.get_boolean("auto-maximize");
+  }
+
+  /**
+  * @returns Whether to animate windows when they are moved or resized.
+  */
+  getAnimateWindowMovement(): boolean {
+    return this.#settings.get_boolean("animate-window-movement");
   }
 }

@@ -73,6 +73,7 @@ export default class extends ExtensionPreferences {
       group.add(this.#entryRow("grid-sizes"));
       group.add(this.#switchRow("auto-close"));
       group.add(this.#switchRow("auto-maximize"));
+      group.add(this.#switchRow("animate-window-movement"));
       group.add(this.#switchRow("follow-cursor"));
       group.add(this.#switchRow("show-icon"));
       group.add(this.#switchRow("show-grid-lines"));

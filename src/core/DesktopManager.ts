@@ -6,6 +6,9 @@ import type {
   LayoutManager,
   Monitor
 } from "resource:///org/gnome/shell/ui/layout.js";
+import type {
+  WindowManager
+} from "resource:///org/gnome/shell/ui/windowManager.js";
 
 import { DesktopEvent, Event, Screen } from "../types/desktop.js";
 import {
@@ -30,6 +33,29 @@ type FrameSize = { width: number; height: number };
 
 type MRect = Mtk.Rectangle;
 
+/**
+ * Private members of Gnome Shell's window manager that drive its window
+ * size-change animation, i.e., the animation shown when a window is maximized.
+ * They are not covered by the type definitions. Other tiling extensions (e.g.
+ * Tiling Assistant and Tiling Shell) animate windows the same way.
+ */
+interface WindowManagerInternals {
+  _resizePending: Set<Meta.WindowActor>;
+  _shouldAnimateActor(actor: Meta.WindowActor, types: Meta.WindowType[]): boolean;
+  _prepareAnimationInfo(
+    shellwm: Shell.WM,
+    actor: Meta.WindowActor,
+    oldFrameRect: MRect,
+    change: Meta.SizeChange,
+  ): void;
+  _clearAnimationInfo(actor: Meta.WindowActor): boolean;
+}
+
+// Duration (in ms) after which a prepared animation is abandoned if the window
+// did not change in the meantime, e.g., because its size constraints kept it
+// in place. Gnome Shell keeps the window frozen until then.
+const AnimationTimeout = 1000;
+
 const TitleBlacklist: RegExp[] = [
   // Desktop Icons NG (see https://github.com/gTile/gTile/issues/336#issuecomment-1804267328) before June 2025
   // https://gitlab.com/rastersoft/desktop-icons-ng/-/blob/cfe944e2ce7a1d27e47b08c002cd100a1e2cb878/app/desktopManager.js#L396
@@ -47,6 +73,7 @@ export interface DesktopManagerParams {
   layoutManager: LayoutManager;
   monitorManager: Meta.MonitorManager;
   workspaceManager: Meta.WorkspaceManager;
+  windowManager: WindowManager;
   userPreferences: UserPreferencesProvider;
 }
 
@@ -60,8 +87,10 @@ export default class implements Publisher<DesktopEvent>, GarbageCollector {
   #display: Meta.Display;
   #layoutManager: LayoutManager;
   #workspaceManager: Meta.WorkspaceManager;
+  #windowManager: WindowManagerInternals;
   #userPreferences: UserPreferencesProvider;
   #dispatchCallbacks: DispatchFn<DesktopEvent>[];
+  #animationTimeouts: Set<ReturnType<typeof setTimeout>>;
 
   constructor({
     shell,
@@ -69,6 +98,7 @@ export default class implements Publisher<DesktopEvent>, GarbageCollector {
     layoutManager,
     monitorManager,
     workspaceManager,
+    windowManager,
     userPreferences,
   }: DesktopManagerParams) {
     this.#gc = new GarbageCollection();
@@ -76,8 +106,11 @@ export default class implements Publisher<DesktopEvent>, GarbageCollector {
     this.#display = display;
     this.#layoutManager = layoutManager;
     this.#workspaceManager = workspaceManager;
+    this.#windowManager = windowManager as unknown as WindowManagerInternals;
     this.#userPreferences = userPreferences;
     this.#dispatchCallbacks = [];
+    this.#animationTimeouts = new Set();
+    this.#gc.defer(() => this.#animationTimeouts.forEach(clearTimeout));
 
     {
       const chid = monitorManager.connect("monitors-changed", () => {
@@ -525,6 +558,10 @@ export default class implements Publisher<DesktopEvent>, GarbageCollector {
   }
 
   #moveResize(target: Meta.Window, x: number, y: number, size?: FrameSize) {
+    const
+      wasMaximized = target.maximized_horizontally || target.maximized_vertically,
+      oldFrame = target.get_frame_rect();
+
     target.set_unmaximize_flags(Meta.MaximizeFlags.BOTH);
     target.unmaximize();
 
@@ -535,6 +572,28 @@ export default class implements Publisher<DesktopEvent>, GarbageCollector {
     x += spacing;
     y += spacing;
 
+    const
+      width = size ? size.width - spacing * 2 : oldFrame.width,
+      height = size ? size.height - spacing * 2 : oldFrame.height;
+
+    if (this.#userPreferences.getAnimateWindowMovement()) {
+      // Gnome Shell animates un-maximizing on its own and that animation ends
+      // at the window's final position, so only non-maximized windows need it.
+      if (!wasMaximized) {
+        this.#prepareAnimation(target, oldFrame, { x, y, width, height });
+      }
+
+      // The animation follows the first geometry change of the window. Moving
+      // and resizing therefore has to happen in a single step, which rules out
+      // the `move_frame` workaround below.
+      if (size) {
+        target.move_resize_frame(true, x, y, width, height);
+      } else {
+        target.move_frame(true, x, y);
+      }
+      return;
+    }
+
     // As of Nov '23 the `move_resize_frame` works for almost all application
     // windows. However, a user report pointed out that for gVim, the window is
     // not moved but only resized. The call to `move_frame` fixes that. There
@@ -544,9 +603,53 @@ export default class implements Publisher<DesktopEvent>, GarbageCollector {
     // https://github.com/gTile/gTile/issues/336#issuecomment-1803025082
     target.move_frame(true, x, y);
     if (size) {
-      const { width: w, height: h } = size;
-      target.move_resize_frame(true, x, y, w - spacing * 2, h - spacing * 2);
+      target.move_resize_frame(true, x, y, width, height);
     }
+  }
+
+  /**
+   * Lets Gnome Shell animate the next geometry change of a window from
+   * {@link oldFrame} to wherever the window ends up, just like it animates
+   * maximizing a window.
+   *
+   * @param target The window that is about to be moved and/or resized.
+   * @param oldFrame The window frame before the operation.
+   * @param newFrame The requested window frame.
+   */
+  #prepareAnimation(target: Meta.Window, oldFrame: MRect, newFrame: Rectangle) {
+    // Gnome truncates fractional coordinates. Without an actual change, Gnome
+    // Shell would wait in vain for the window to change and keep it frozen.
+    const
+      actor = target.get_compositor_private<Meta.WindowActor | null>(),
+      moves =
+        oldFrame.x !== Math.trunc(newFrame.x) ||
+        oldFrame.y !== Math.trunc(newFrame.y),
+      resizes = target.allows_resize() && (
+        oldFrame.width !== Math.trunc(newFrame.width) ||
+        oldFrame.height !== Math.trunc(newFrame.height));
+
+    const wm = this.#windowManager;
+    if (!actor || !(moves || resizes) ||
+        !wm._shouldAnimateActor(actor, [Meta.WindowType.NORMAL])) {
+      return;
+    }
+
+    // Finishes a still running animation so that this one can take over.
+    actor.remove_all_transitions();
+    wm._prepareAnimationInfo(
+      this.#shell.window_manager,
+      actor,
+      oldFrame,
+      Meta.SizeChange.UNMAXIMIZE,
+    );
+
+    const id = setTimeout(() => {
+      this.#animationTimeouts.delete(id);
+      if (wm._resizePending.delete(actor)) {
+        wm._clearAnimationInfo(actor);
+      }
+    }, AnimationTimeout);
+    this.#animationTimeouts.add(id);
   }
 
   #fit(target: Meta.Window, { x, y, width, height }: Rectangle) {
